@@ -395,16 +395,16 @@ module Make_commands (Backend : Backend_intf.S) = struct
            you can accidentally incur an ~8us interrupt on every call until perf disables
            your breakpoint for exceeding the hit rate limit. *)
         let single_hit = not opts.multi_snapshot in
-        let bp = Breakpoint.breakpoint_fd head_pid ~addr ~single_hit in
+        let bp = Breakpoint.All_threads.of_process head_pid ~addr ~single_hit in
         let bp = Or_error.ok_exn bp in
         let fd =
           Async_unix.Fd.create
             Async_unix.Fd.Kind.File
-            (Breakpoint.fd bp)
+            (Breakpoint.All_threads.fd bp)
             (Info.of_string "perf breakpoint")
         in
         let rec read_evs snapshot_enabled =
-          match Breakpoint.next_hit bp with
+          match Breakpoint.All_threads.next_hit bp with
           | Some hit ->
             if snapshot_enabled then take_snapshot_on_hit (name, hit);
             read_evs false
@@ -420,7 +420,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
             ()
         in
         (match res with
-         | `Interrupted -> Breakpoint.destroy bp
+         | `Interrupted -> Breakpoint.All_threads.destroy bp
          | `Bad_fd | `Closed | `Unsupported -> failwith "failed to wait on breakpoint")
     in
     { Attachment.recording; done_ivar; breakpoint_done; finalize_recording }
@@ -602,6 +602,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
        in
        fun () ->
          let open Deferred.Or_error.Let_syntax in
+         Breakpoint.Signal_delivery.configure_async_runtime ();
          let%bind () = check_for_perf () in
          let prog =
            match List.hd argv with
@@ -706,6 +707,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
        in
        fun () ->
          let open Deferred.Or_error.Let_syntax in
+         Breakpoint.Signal_delivery.configure_async_runtime ();
          let%bind () = check_for_perf () in
          let%bind (pids : Pid.t list) =
            match pids with
