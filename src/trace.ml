@@ -395,33 +395,14 @@ module Make_commands (Backend : Backend_intf.S) = struct
            you can accidentally incur an ~8us interrupt on every call until perf disables
            your breakpoint for exceeding the hit rate limit. *)
         let single_hit = not opts.multi_snapshot in
-        let bp = Breakpoint.All_threads.of_process head_pid ~addr ~single_hit in
-        let bp = Or_error.ok_exn bp in
-        let fd =
-          Async_unix.Fd.create
-            Async_unix.Fd.Kind.File
-            (Breakpoint.All_threads.fd bp)
-            (Info.of_string "perf breakpoint")
-        in
-        let rec read_evs snapshot_enabled =
-          match Breakpoint.All_threads.next_hit bp with
-          | Some hit ->
-            if snapshot_enabled then take_snapshot_on_hit (name, hit);
-            read_evs false
-          | None -> ()
-        in
         let interrupt = Ivar.read done_ivar in
-        let%map.Deferred res =
-          Async_unix.Fd.interruptible_every_ready_to
-            fd
-            `Read
-            ~interrupt
-            (fun () -> read_evs true)
-            ()
-        in
-        (match res with
-         | `Interrupted -> Breakpoint.All_threads.destroy bp
-         | `Bad_fd | `Closed | `Unsupported -> failwith "failed to wait on breakpoint")
+        Breakpoint.All_cpus.with_process_filtering__resolve_when_done
+          head_pid
+          ~addr
+          ~single_hit
+          ~interrupt
+          ~on_async_cycle_with_hit:(fun hit -> take_snapshot_on_hit (name, hit))
+        |> Or_error.ok_exn
     in
     { Attachment.recording; done_ivar; breakpoint_done; finalize_recording }
   ;;
@@ -602,7 +583,6 @@ module Make_commands (Backend : Backend_intf.S) = struct
        in
        fun () ->
          let open Deferred.Or_error.Let_syntax in
-         Breakpoint.Signal_delivery.configure_async_runtime ();
          let%bind () = check_for_perf () in
          let prog =
            match List.hd argv with
@@ -707,7 +687,6 @@ module Make_commands (Backend : Backend_intf.S) = struct
        in
        fun () ->
          let open Deferred.Or_error.Let_syntax in
-         Breakpoint.Signal_delivery.configure_async_runtime ();
          let%bind () = check_for_perf () in
          let%bind (pids : Pid.t list) =
            match pids with

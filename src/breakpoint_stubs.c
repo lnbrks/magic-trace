@@ -1,19 +1,12 @@
-#define _GNU_SOURCE
-#include <unistd.h>
 #include <assert.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
-#include <stdbool.h>
-#include <signal.h>
+#include <unistd.h>
 
-
-#include <sys/fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/signalfd.h>
 #include <sys/syscall.h>
-#undef _GNU_SOURCE
 
 #include <asm/perf_regs.h>
 #include <linux/hw_breakpoint.h>
@@ -24,7 +17,6 @@
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
-
 
 #include "perf_utils.h"
 
@@ -74,45 +66,34 @@ CAMLprim value magic_breakpoint_fd_stub(value state) {
   return Val_long(Breakpoint_state_val(state)->fd);
 }
 
-CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
-    value single_hit, value inherit_and_set_signal_delivery,
-    value signal_tid, value which_signal) {
-  CAMLparam5(pid, addr, single_hit, inherit_and_set_signal_delivery, signal_tid);
-  CAMLxparam1(which_signal);
+CAMLprim value magic_breakpoint_create_stub(value tid, value cpu, value addr, value single_hit) {
+  CAMLparam4(tid, cpu, addr, single_hit);
   CAMLlocal2(wrap, v);
   struct perf_event_attr attr;
 
-  printf("oo im gonna try to open! size: %d\n", sizeof(attr));
-
   memset(&attr, 0, sizeof(attr));
-  attr.type = PERF_TYPE_BREAKPOINT;
   attr.size = sizeof(attr);
-  attr.sample_period = 1;
-  attr.disabled = 0;
-  attr.inherit = 1;
+  attr.type = PERF_TYPE_BREAKPOINT;
   attr.bp_type = HW_BREAKPOINT_X;
   attr.bp_addr = Int64_val(addr);
   attr.bp_len = sizeof(long);
   attr.sample_period = 1;
-  attr.sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_IP /*| PERF_SAMPLE_REGS_USER */ | PERF_SAMPLE_TID ;
+  attr.sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_IP | PERF_SAMPLE_REGS_USER |
+                     PERF_SAMPLE_TID ;
+  attr.wakeup_events = 1;
+  attr.exclude_hv = 1;
+  attr.exclude_kernel = 1;
+  attr.disabled = Bool_val(single_hit);
   attr.wakeup_events = 1;
   attr.precise_ip = 2;
-  // attr.exclude_hv = 1;
-  // attr.exclude_kernel = 1;
-  // attr.inherit = Bool_val(inherit_and_set_signal_delivery);
-  // attr.inherit = 1;
-  // attr.disabled = Bool_val(single_hit);
-  // attr.wakeup_events = 1;
-  // attr.precise_ip = 2;
   // first and second argument register
-  // attr.sample_regs_user = (1ul << PERF_REG_X86_DI) | (1ul << PERF_REG_X86_SI);
+  attr.sample_regs_user = (1ul << PERF_REG_X86_DI) | (1ul << PERF_REG_X86_SI);
   // calloc returns zeroed memory so we don't try to free garbage in error cases
   struct breakpoint_state *s = calloc(1, sizeof(*s));
 
   s->fd =
-      sys_perf_event_open(&attr, Long_val(pid), -1, -1, PERF_FLAG_FD_CLOEXEC);
+    sys_perf_event_open(&attr, Long_val(tid), Int_val(cpu), -1, PERF_FLAG_FD_CLOEXEC);
 
-  printf("perf fd result: %d\n", s->fd);
   if (s->fd < 0)
     goto failed;
 
@@ -120,11 +101,8 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
       sysconf(_SC_PAGESIZE) * (1 + 1); // one metadata page plus one page buffer
   // The PROT_READ and PROT_WRITE is how we tell perf we'll be updating
   // data_tail
-  /* s->mmap =
-   *     mmap(NULL, s->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0); */
   s->mmap =
-    mmap(NULL, 0x1000 * 2, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
-  printf("perf mmap result: %d\n", s->mmap);
+    mmap(NULL, s->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
   if (s->mmap == MAP_FAILED)
     goto failed;
 
@@ -132,16 +110,6 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
   if (Bool_val(single_hit)) {
     if (ioctl(s->fd, PERF_EVENT_IOC_REFRESH, 1) < 0)
       goto failed;
-  }
-
-  if (Bool_val(inherit_and_set_signal_delivery)) {
-    // use _EX to set up delivery to the particular thread
-    struct f_owner_ex owner;
-    owner.type = F_OWNER_TID;
-    owner.pid = Long_val(signal_tid);
-    if (fcntl(s->fd, F_SETOWN_EX, &owner) < 0) goto failed;
-    if (fcntl(s->fd, F_SETFL, O_ASYNC) < 0) goto failed;
-    if (fcntl(s->fd, F_SETSIG, Long_val(which_signal)) < 0) goto failed;
   }
 
   v = caml_alloc_custom(&breakpoint_state_ops, sizeof(s), 0, 1);
@@ -160,12 +128,6 @@ failed:
   CAMLreturn(wrap);
 }
 
-CAMLprim value magic_breakpoint_create_stub_bytecode(value* argv, int argn) {
-  assert(6 == argn);
-  return magic_breakpoint_create_stub_native(argv[0], argv[1], argv[2], argv[3],
-                                             argv[4], argv[5]);
-}
-
 struct my_sample {
   struct perf_event_header header;
   uint64_t ip;
@@ -175,23 +137,40 @@ struct my_sample {
   uint64_t regs[2];
 };
 
-CAMLprim value magic_breakpoint_next_stub(value state) {
+CAMLprim value magic_breakpoint_next_stub(value state, value require_pid_arg) {
   CAMLparam1(state);
   CAMLlocal3(res, info, ip);
   struct breakpoint_state *s = Breakpoint_state_val(state);
   if (!s)
     CAMLreturn(Val_none);
 
+  uint32_t require_pid = 0;
+  if (Int_val(require_pid_arg) > 0) {
+    require_pid = Int_val(require_pid_arg);
+  }
+
   char *cur = (char *)s->mmap + s->mmap->data_offset +
               (s->mmap->data_tail % s->mmap->data_size);
   char *events_end = (char *)s->mmap + s->mmap->data_offset +
                      (s->mmap->data_head % s->mmap->data_size);
+  res = Val_none;
+
   rmb();
 
   while (cur < events_end) {
     struct perf_event_header *ev = (struct perf_event_header *)cur;
+    // CR ibrooks: check for perf_event_lost? Do we know if breakpoints generate these?
+    // CR ibrooks: wrap around the ring buffer?
     if (ev->type == PERF_RECORD_SAMPLE) {
       struct my_sample *samp = (struct my_sample *)ev;
+
+      // Ignore events with non-matching PIDs. When attaching to a cpu, this is
+      // expected when the breakpoint address is used in other processes.
+      if (require_pid && require_pid != samp->pid) {
+        printf("pid mismatch %d %d\n", require_pid, samp->pid);
+        goto next_event;
+      }
+
       // These may be nonsense but nothing should go wrong if they are.
       // We untag and retag unconditionally so that if it is garbage the
       // value passed to OCaml is a garbage integer and never a garbage pointer.
@@ -213,65 +192,11 @@ CAMLprim value magic_breakpoint_next_stub(value state) {
       // this value to not overwrite data until we've read it.
       s->mmap->data_tail += ev->size;
       CAMLreturn(res);
-    } else {
-      s->mmap->data_tail += ev->size;
     }
+  next_event:
+    s->mmap->data_tail += ev->size;
     cur += ev->size;
   }
-  CAMLreturn(Val_none);
+  CAMLreturn(res);
 }
 
-
-
-CAMLprim value magic_breakpoint_signal_delivery_setup_stub(value signal) {
-  CAMLparam1(signal);
-  sigset_t mask;
-  sigemptyset(&mask);
-  sigaddset(&mask, Int_val(signal));
-  if (pthread_sigmask(SIG_BLOCK, &mask, NULL) < 0) {
-    caml_failwith("Couldn't set signal mask.");
-  }
-  CAMLreturn(Val_unit);
-}
-
-CAMLprim value magic_breakpoint_make_signal_fd_stub(value signal) {
-  CAMLparam1(signal);
-  sigset_t mask;
-  sigemptyset(&mask);
-  sigaddset(&mask, Int_val(signal));
-  int fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
-  if (fd < 0) {
-    caml_failwith("Couldn't create signalfd.");
-  }
-  CAMLreturn(Val_int(fd));
-}
-
-CAMLprim value magic_breakpoint_signal_fd_which_triggered_stub(value fd) {
-  CAMLparam1(fd);
-
-  // Since there is only one signal in the mask of the signalfd, there is never
-  // a reason to read more than one siginfo. We read the info of the signal that
-  // arrived first, per signal(7).
-  struct signalfd_siginfo info;
-  ssize_t res;
-  do {
-    ssize_t res = read(Int_val(fd), &info, sizeof info);
-  } while (res < 0 && errno == EINTR);
-
-  if (res < 0 && errno == EAGAIN) {
-    CAMLreturn(Val_int(-1)); // There is no signal
-  } else if (res < 0 || res != sizeof info) {
-    caml_failwith("Something went wrong reading from signalfd");
-  }
-  if (info.ssi_code != SIGIO) {
-    caml_failwith("Breakpoint signalfd got a non SIGIO-coded signal.");
-  }
-  CAMLreturn(Val_int(info.ssi_fd));
-}
-
-
-CAMLprim value magic_breakpoint_signal_fd_destroy_stub(value fd) {
-  CAMLparam1(fd);
-  close(Int_val(fd));
-  CAMLreturn(Val_unit);
-}
