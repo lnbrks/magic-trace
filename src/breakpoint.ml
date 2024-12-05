@@ -25,10 +25,11 @@ module Signal_delivery = struct
      when we mask it and use a signalfd *)
 
   module Fd = struct
-    type outer = t
     type t = Core_unix.File_descr.t
 
-    external create : outer -> t = "magic_breakpoint_make_signal_fd_stub"
+    external create : signal:int -> t = "magic_breakpoint_make_signal_fd_stub"
+
+    let create () = create ~signal:marker_signal
 
     let inner t =
       (* The thread we are on matters at poll/read time, not at signalfd
@@ -113,6 +114,8 @@ module Perf_bp = struct
       | `Inherit_and_signal_this_thread tid ->
         true, Core_unix.Thread_id.to_int tid, Signal_delivery.marker_signal
     in
+    (* Inherited counters can't use PERF_EVENT_IOC_REFRESH *)
+    (* assert (not (single_hit && inherit_and_set_signal_delivery)); *)
     match
       create
         ~pid
@@ -152,7 +155,8 @@ module All_threads = struct
     ; fd_to_breakpoint : Perf_bp.t Int.Map.t
     }
 
-  let of_process pid ~addr ~single_hit =
+  (* CR ibrooks: emulate single hit behavior somehow *)
+  let of_process pid ~addr ~single_hit:_  =
     (* ibrooks: When we are attaching to a running a process, installing breakpoints that
        inherit on thread creation is racy with thread creation itself. Without stopping
        the process first, we can't be sure that our breakpoint was installed before the
@@ -193,7 +197,7 @@ module All_threads = struct
     *)
     let open Or_error.Let_syntax in
     let signal_delivery = Signal_delivery.setup_on_this_thread () in
-    let signal_fd = Signal_delivery.Fd.create signal_delivery in
+    let signal_fd = Signal_delivery.Fd.create () in
     let tids_before_breakpoint_install = get_tids pid in
     let%map fd_to_breakpoint =
       Set.fold tids_before_breakpoint_install ~init:(Ok Int.Map.empty) ~f:(fun acc tid ->
@@ -202,7 +206,7 @@ module All_threads = struct
           Perf_bp.create
             tid
             ~addr
-            ~single_hit
+            ~single_hit:false
             ~inherit_behavior:(`Inherit_and_signal_this_thread signal_delivery)
         in
         let fd = Perf_bp.get_fd bkpt_fd in
@@ -223,38 +227,48 @@ module All_threads = struct
   ;;
 
   (* CR ibrooks: do we need to dup here? *)
-  let fd t = Signal_delivery.Fd.inner t.signal_fd
+  let fd t = Signal_delivery.Fd.inner t.signal_fd |> Core_unix.dup
 
   let next_hit t =
     (* CR-someday ibrooks: if we get multiple breakpoint hits faster than we can process
        them, the second signal will be dropped, meaning we won't know to look for the
        second hit. We can handle this by iterating over breakpoint FDs and polling for
        breakpoint hits. *)
+    Core.eprintf "Got next hit!!\n";
     let triggered_fd = Signal_delivery.Fd.which_breakpoint_fd_triggered t.signal_fd in
     if triggered_fd > 0
-    then (
-      let triggered_bp =
-        Map.find t.fd_to_breakpoint triggered_fd
-        |> Option.value_exn
-             ~message:"Signal had an fd value that wasn't in the breakpoint map."
-      in
-      match Perf_bp.next_hit triggered_bp with
-      | Some hit -> Some hit
-      | None ->
-        failwith "Expected breakpoint that originated signal to have a hit to collect.")
-    else
-      (* If there's no signal, check if there are any other hits on other FDs. This is
-         slow if we have a lot of fds, but we'll only hit this after we've already acted
-         on the first breakpoint hit using the signal. *)
-      Map.fold_until
-        t.fd_to_breakpoint
-        ~init:None
-        ~f:(fun ~key:_ ~data:perf_fd _acc ->
-          match Perf_bp.next_hit perf_fd with
-          | None -> Continue None
-          | Some hit -> Stop (Some hit))
-        ~finish:Fn.id
+    then
+      Some
+        { Hit.timestamp = Time_ns.Span.of_int_ms 0
+        ; passed_timestamp = Time_ns.Span.of_int_ms 0
+        ; passed_val = 0
+        ; tid = Pid.of_int 1
+        ; ip = Int64.of_int 0
+        }
+      (* (
+         * let triggered_bp =
+         *   Map.find t.fd_to_breakpoint triggered_fd
+         *   |> Option.value_exn
+         *        ~message:"Signal had an fd value that wasn't in the breakpoint map."
+         * in
+         * match Perf_bp.next_hit triggered_bp with
+         * | Some hit -> Some hit
+         * | None ->
+         *   failwith "Expected breakpoint that originated signal to have a hit to collect.") *)
+    else None
   ;;
+
+  (* (* If there's no signal, check if there are any other hits on other FDs. This is
+   *    slow if we have a lot of fds, but we'll only hit this after we've already acted
+   *    on the first breakpoint hit using the signal. *)
+   * Map.fold_until
+   *   t.fd_to_breakpoint
+   *   ~init:None
+   *   ~f:(fun ~key:_ ~data:perf_fd _acc ->
+   *     match Perf_bp.next_hit perf_fd with
+   *     | None -> Continue None
+   *     | Some hit -> Stop (Some hit))
+   *   ~finish:Fn.id *)
 
   let destroy t =
     Signal_delivery.Fd.destroy t.signal_fd;

@@ -4,15 +4,15 @@ module Signal_delivery : sig
   type t
 
   module Fd : sig
-    type outer := t
     type t
 
-    val create : outer -> t
+    val create : unit -> t
 
     (* CR-someday ibrooks: Look into making an API that slots into Async such that we can
        do a runtime check for signal mask and TID correctness just before polling. *)
 
-    (** This must be polled from the same OS thread that called [Signal_delivery.create] *)
+    (** This must be polled from the same OS thread that called
+        [Signal_delivery.setup_on_this_thread] *)
     val inner : t -> Core_unix.File_descr.t
 
     (** If multiple breakpoint perf fds are open, you must disambiguate which one fired to

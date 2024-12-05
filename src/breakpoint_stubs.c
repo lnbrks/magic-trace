@@ -82,56 +82,48 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
   CAMLlocal2(wrap, v);
   struct perf_event_attr attr;
 
-  printf("oo im gonna try to open! size: %d\n", sizeof(attr));
-
   memset(&attr, 0, sizeof(attr));
-  attr.type = PERF_TYPE_BREAKPOINT;
   attr.size = sizeof(attr);
-  attr.sample_period = 1;
-  attr.disabled = 0;
-  attr.inherit = 1;
+  attr.type = PERF_TYPE_BREAKPOINT;
   attr.bp_type = HW_BREAKPOINT_X;
   attr.bp_addr = Int64_val(addr);
   attr.bp_len = sizeof(long);
   attr.sample_period = 1;
-  attr.sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_IP /*| PERF_SAMPLE_REGS_USER */ | PERF_SAMPLE_TID ;
+  attr.sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_IP | PERF_SAMPLE_REGS_USER |
+                     PERF_SAMPLE_TID;
+  attr.exclude_hv = 1;
+  attr.exclude_kernel = 1;
+  attr.disabled = Bool_val(single_hit);
   attr.wakeup_events = 1;
+  attr.inherit = Bool_val(inherit_and_set_signal_delivery);
   attr.precise_ip = 2;
-  // attr.exclude_hv = 1;
-  // attr.exclude_kernel = 1;
-  // attr.inherit = Bool_val(inherit_and_set_signal_delivery);
-  // attr.inherit = 1;
-  // attr.disabled = Bool_val(single_hit);
-  // attr.wakeup_events = 1;
-  // attr.precise_ip = 2;
   // first and second argument register
-  // attr.sample_regs_user = (1ul << PERF_REG_X86_DI) | (1ul << PERF_REG_X86_SI);
+  attr.sample_regs_user = (1ul << PERF_REG_X86_DI) | (1ul << PERF_REG_X86_SI);
   // calloc returns zeroed memory so we don't try to free garbage in error cases
   struct breakpoint_state *s = calloc(1, sizeof(*s));
 
   s->fd =
       sys_perf_event_open(&attr, Long_val(pid), -1, -1, PERF_FLAG_FD_CLOEXEC);
 
-  printf("perf fd result: %d\n", s->fd);
   if (s->fd < 0)
     goto failed;
 
-  s->mmap_size =
+  if (!(Bool_val(inherit_and_set_signal_delivery))) {
+    s->mmap_size =
       sysconf(_SC_PAGESIZE) * (1 + 1); // one metadata page plus one page buffer
-  // The PROT_READ and PROT_WRITE is how we tell perf we'll be updating
-  // data_tail
-  /* s->mmap =
-   *     mmap(NULL, s->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0); */
-  s->mmap =
-    mmap(NULL, 0x1000 * 2, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
-  printf("perf mmap result: %d\n", s->mmap);
-  if (s->mmap == MAP_FAILED)
-    goto failed;
+    // The PROT_READ and PROT_WRITE is how we tell perf we'll be updating
+    // data_tail
+    s->mmap =
+      mmap(NULL, s->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
+    if (s->mmap == MAP_FAILED)
+      goto failed;
+  }
 
   // Makes it so the breakpoint only triggers once before being disabled
   if (Bool_val(single_hit)) {
-    if (ioctl(s->fd, PERF_EVENT_IOC_REFRESH, 1) < 0)
+    if (ioctl(s->fd, PERF_EVENT_IOC_REFRESH, 1) < 0) {
       goto failed;
+    }
   }
 
   if (Bool_val(inherit_and_set_signal_delivery)) {
@@ -150,6 +142,7 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
   wrap = caml_alloc(1, 0); // Ok constructor of result
   Field(wrap, 0) = v;
 
+  printf("Successful return!\n");
   CAMLreturn(wrap);
 failed:
   close(s->fd);
@@ -255,16 +248,19 @@ CAMLprim value magic_breakpoint_signal_fd_which_triggered_stub(value fd) {
   struct signalfd_siginfo info;
   ssize_t res;
   do {
-    ssize_t res = read(Int_val(fd), &info, sizeof info);
+    res = read(Int_val(fd), &info, sizeof info);
   } while (res < 0 && errno == EINTR);
 
   if (res < 0 && errno == EAGAIN) {
     CAMLreturn(Val_int(-1)); // There is no signal
   } else if (res < 0 || res != sizeof info) {
+    printf("Read actual size %ld\n", res);
+    fflush(stdout);
     caml_failwith("Something went wrong reading from signalfd");
   }
-  if (info.ssi_code != SIGIO) {
-    caml_failwith("Breakpoint signalfd got a non SIGIO-coded signal.");
+  if (info.ssi_code != SIGIOT /* single_hit case, which we can't actually use with inherit */
+      && info.ssi_code != SIGHUP /* non-single_hit case */) {
+    caml_failwith("Breakpoint signalfd got a bad ssi_code signal.");
   }
   CAMLreturn(Val_int(info.ssi_fd));
 }
