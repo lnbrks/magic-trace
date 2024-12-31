@@ -1,9 +1,9 @@
-#define _GNU_SOURCE
-#include <unistd.h>
+#define _GNU_SOURCE // fcntl signal handling
 #include <assert.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <signal.h>
 
@@ -121,9 +121,8 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
 
   // Makes it so the breakpoint only triggers once before being disabled
   if (Bool_val(single_hit)) {
-    if (ioctl(s->fd, PERF_EVENT_IOC_REFRESH, 1) < 0) {
+    if (ioctl(s->fd, PERF_EVENT_IOC_REFRESH, 1) < 0)
       goto failed;
-    }
   }
 
   if (Bool_val(inherit_and_set_signal_delivery)) {
@@ -142,7 +141,6 @@ CAMLprim value magic_breakpoint_create_stub_native(value pid, value addr,
   wrap = caml_alloc(1, 0); // Ok constructor of result
   Field(wrap, 0) = v;
 
-  printf("Successful return!\n");
   CAMLreturn(wrap);
 failed:
   close(s->fd);
@@ -214,7 +212,18 @@ CAMLprim value magic_breakpoint_next_stub(value state) {
   CAMLreturn(Val_none);
 }
 
+CAMLprim value magic_breakpoint_disable_stub(value state) {
+  CAMLparam1(state);
+  struct breakpoint_state *s = Breakpoint_state_val(state);
+  if (!s)
+    CAMLreturn(Val_int(-1));
 
+  if (ioctl(s->fd, PERF_EVENT_IOC_ENABLE) != 0) {
+    CAMLreturn(Val_int(errno));
+  }
+
+  CAMLreturn(Val_int(0));
+}
 
 CAMLprim value magic_breakpoint_signal_delivery_setup_stub(value signal) {
   CAMLparam1(signal);
@@ -254,8 +263,6 @@ CAMLprim value magic_breakpoint_signal_fd_which_triggered_stub(value fd) {
   if (res < 0 && errno == EAGAIN) {
     CAMLreturn(Val_int(-1)); // There is no signal
   } else if (res < 0 || res != sizeof info) {
-    printf("Read actual size %ld\n", res);
-    fflush(stdout);
     caml_failwith("Something went wrong reading from signalfd");
   }
   if (info.ssi_code != SIGIOT /* single_hit case, which we can't actually use with inherit */

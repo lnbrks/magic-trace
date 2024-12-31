@@ -381,7 +381,8 @@ module Make_commands (Backend : Backend_intf.S) = struct
         ~data:([%sexp (recording_data : Backend.Recording.Data.t)] |> Sexp.to_string)
     in
     let take_snapshot_on_hit hit =
-      hits := hit :: !hits;
+      (* hits := hit :: !hits; *)
+      ignore hit;
       take_snapshot ~source:`function_call
     in
     let breakpoint_done =
@@ -396,25 +397,16 @@ module Make_commands (Backend : Backend_intf.S) = struct
            your breakpoint for exceeding the hit rate limit. *)
         let single_hit = not opts.multi_snapshot in
         let bp = Breakpoint.All_threads.of_process head_pid ~addr ~single_hit in
-        (* let bp =
-         *   Breakpoint.Perf_bp.create
-         *     head_pid
-         *     ~addr
-         *     ~single_hit
-         *     ~inherit_behavior:`Do_not_inherit
-         * in *)
         let bp = Or_error.ok_exn bp in
         let fd =
           Async_unix.Fd.create
             Async_unix.Fd.Kind.File
             (Breakpoint.All_threads.fd bp)
-            (* (Breakpoint.Perf_bp.fd bp) *)
             (Info.of_string "perf breakpoint")
         in
         let start = Time_ns.now () in
         let rec read_evs snapshot_enabled =
           match Breakpoint.All_threads.next_hit bp with
-          (* match Breakpoint.Perf_bp.next_hit bp with *)
           | Some hit ->
             if snapshot_enabled
             then (
@@ -437,7 +429,6 @@ module Make_commands (Backend : Backend_intf.S) = struct
         in
         (match res with
          | `Interrupted -> Breakpoint.All_threads.destroy bp
-         (* | `Interrupted -> Breakpoint.Perf_bp.destroy bp *)
          | `Bad_fd | `Closed | `Unsupported -> failwith "failed to wait on breakpoint")
     in
     { Attachment.recording; done_ivar; breakpoint_done; finalize_recording }

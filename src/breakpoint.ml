@@ -115,7 +115,7 @@ module Perf_bp = struct
         true, Core_unix.Thread_id.to_int tid, Signal_delivery.marker_signal
     in
     (* Inherited counters can't use PERF_EVENT_IOC_REFRESH *)
-    (* assert (not (single_hit && inherit_and_set_signal_delivery)); *)
+    assert (not (single_hit && inherit_and_set_signal_delivery));
     match
       create
         ~pid
@@ -135,6 +135,7 @@ module Perf_bp = struct
 
   external destroy : t -> unit = "magic_breakpoint_destroy_stub"
   external next_hit : t -> Hit.t option = "magic_breakpoint_next_stub"
+  external disable : t -> int = "magic_breakpoint_disable_stub"
 end
 
 let get_tids pid : Pid.Set.t =
@@ -153,10 +154,11 @@ module All_threads = struct
   type t =
     { signal_fd : Signal_delivery.Fd.t
     ; fd_to_breakpoint : Perf_bp.t Int.Map.t
+    ; single_hit : bool
     }
 
   (* CR ibrooks: emulate single hit behavior somehow *)
-  let of_process pid ~addr ~single_hit:_  =
+  let of_process pid ~addr ~single_hit =
     (* ibrooks: When we are attaching to a running a process, installing breakpoints that
        inherit on thread creation is racy with thread creation itself. Without stopping
        the process first, we can't be sure that our breakpoint was installed before the
@@ -223,7 +225,20 @@ module All_threads = struct
            this."
             (tids_before_breakpoint_install : Pid.Set.t)
             (tids_after_breakpoint_install : Pid.Set.t)];
-    { signal_fd; fd_to_breakpoint }
+    { signal_fd; fd_to_breakpoint; single_hit }
+  ;;
+
+  let emulate_single_hit_after_trigger t =
+    if t.single_hit
+    then
+      Map.iter t.fd_to_breakpoint ~f:(fun bp ->
+        match Perf_bp.disable bp with
+        | 0 -> ()
+        | errno ->
+          raise_s
+            [%message
+              "Couldn't disable breakpoint"
+                ~error:(Core_unix.Error.of_system_int ~errno : Core_unix.Error.t)])
   ;;
 
   (* CR ibrooks: do we need to dup here? *)
@@ -237,7 +252,8 @@ module All_threads = struct
     Core.eprintf "Got next hit!!\n";
     let triggered_fd = Signal_delivery.Fd.which_breakpoint_fd_triggered t.signal_fd in
     if triggered_fd > 0
-    then
+    then (
+      emulate_single_hit_after_trigger t;
       Some
         { Hit.timestamp = Time_ns.Span.of_int_ms 0
         ; passed_timestamp = Time_ns.Span.of_int_ms 0
@@ -254,7 +270,7 @@ module All_threads = struct
          * match Perf_bp.next_hit triggered_bp with
          * | Some hit -> Some hit
          * | None ->
-         *   failwith "Expected breakpoint that originated signal to have a hit to collect.") *)
+         *   failwith "Expected breakpoint that originated signal to have a hit to collect.") *))
     else None
   ;;
 
