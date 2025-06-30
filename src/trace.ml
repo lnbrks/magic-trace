@@ -301,6 +301,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
       ; trace_scope : Trace_scope.t
       ; timer_resolution : Timer_resolution.t
       ; collection_mode : Collection_mode.t
+      ; control_fd : Control_fd.t option
       }
   end
 
@@ -349,7 +350,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
            let snap_loc = Elf.selection_stop_info elf head_pid snap_sym in
            return (Some snap_loc))
     in
-    let%map.Deferred.Or_error recording, recording_data =
+    let%bind.Deferred.Or_error recording, recording_data =
       Backend.Recording.attach_and_record
         opts.backend_opts
         ~debug_print_perf_commands
@@ -359,6 +360,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
         ~multi_snapshot:opts.multi_snapshot
         ~timer_resolution:opts.timer_resolution
         ~record_dir:opts.record_dir
+        ~start_disabled:(Option.is_some opts.control_fd)
         ~collection_mode
         pids
     in
@@ -384,46 +386,70 @@ module Make_commands (Backend : Backend_intf.S) = struct
       hits := hit :: !hits;
       take_snapshot ~source:`function_call
     in
-    let breakpoint_done =
-      match snap_loc with
-      | None -> Deferred.unit
-      | Some { Elf.Stop_info.name; addr; _ } ->
-        Core.eprintf "[ Attaching to %s @ 0x%016Lx ]\n%!" name addr;
-        (* This is a safety feature so that if you accidentally attach to a symbol that
-           gets called very frequently, in single snapshot mode it will only trigger the
-           breakpoint once before the breakpoint gets disabled. In [multi_snapshot] mode
-           you can accidentally incur an ~8us interrupt on every call until perf disables
-           your breakpoint for exceeding the hit rate limit. *)
-        let single_hit = not opts.multi_snapshot in
-        let bp = Breakpoint.breakpoint_fd head_pid ~addr ~single_hit in
-        let bp = Or_error.ok_exn bp in
-        let fd =
-          Async_unix.Fd.create
-            Async_unix.Fd.Kind.File
-            (Breakpoint.fd bp)
-            (Info.of_string "perf breakpoint")
-        in
-        let rec read_evs snapshot_enabled =
-          match Breakpoint.next_hit bp with
-          | Some hit ->
-            if snapshot_enabled then take_snapshot_on_hit (name, hit);
-            read_evs false
-          | None -> ()
-        in
-        let interrupt = Ivar.read done_ivar in
-        let%map.Deferred res =
-          Async_unix.Fd.interruptible_every_ready_to
-            fd
-            `Read
-            ~interrupt
-            (fun () -> read_evs true)
-            ()
-        in
-        (match res with
-         | `Interrupted -> Breakpoint.destroy bp
+    let breakpoint_done : unit Ivar.t = Ivar.create () in
+    let begin_waiting_on_breakpoint name addr =
+      Core.eprintf "[ Attaching to %s @ 0x%016Lx ]\n%!" name addr;
+      (* This is a safety feature so that if you accidentally attach to a symbol that
+         gets called very frequently, in single snapshot mode it will only trigger the
+         breakpoint once before the breakpoint gets disabled. In [multi_snapshot] mode
+         you can accidentally incur an ~8us interrupt on every call until perf disables
+         your breakpoint for exceeding the hit rate limit. *)
+      let single_hit = not opts.multi_snapshot in
+      let bp = Breakpoint.breakpoint_fd head_pid ~addr ~single_hit in
+      let bp = Or_error.ok_exn bp in
+      let fd =
+        Async_unix.Fd.create
+          Async_unix.Fd.Kind.File
+          (Breakpoint.fd bp)
+          (Info.of_string "perf breakpoint")
+      in
+      let rec read_evs snapshot_enabled =
+        match Breakpoint.next_hit bp with
+        | Some hit ->
+          if snapshot_enabled then take_snapshot_on_hit (name, hit);
+          read_evs false
+        | None -> ()
+      in
+      let interrupt = Ivar.read done_ivar in
+      don't_wait_for
+        (let%map.Deferred res =
+           Async_unix.Fd.interruptible_every_ready_to
+             fd
+             `Read
+             ~interrupt
+             (fun () -> read_evs true)
+             ()
+         in
+         match res with
+         | `Interrupted ->
+           Breakpoint.destroy bp;
+           Ivar.fill breakpoint_done ()
          | `Bad_fd | `Closed | `Unsupported -> failwith "failed to wait on breakpoint")
     in
-    { Attachment.recording; done_ivar; breakpoint_done; finalize_recording }
+    Deferred.return
+      (let%map.Or_error () =
+         match snap_loc, opts.control_fd with
+         | None, Some _ ->
+           Or_error.error_string
+             "controlfds only supported when snapshotting on a breakpoint"
+         | None, None ->
+           Ivar.fill breakpoint_done ();
+           Ok ()
+         | Some { Elf.Stop_info.name; addr; _ }, None ->
+           begin_waiting_on_breakpoint name addr;
+           Ok ()
+         | Some { Elf.Stop_info.name; addr; _ }, Some control_fd ->
+           Control_fd.begin_listening control_fd ~on_enable:(fun () ->
+             Backend.Recording.enable recording |> Or_error.ok_exn;
+             begin_waiting_on_breakpoint name addr);
+           Control_fd.notify_ready control_fd;
+           Ok ()
+       in
+       { Attachment.recording
+       ; done_ivar
+       ; breakpoint_done = Ivar.read breakpoint_done
+       ; finalize_recording
+       })
   ;;
 
   let detach { Attachment.recording; done_ivar; breakpoint_done; finalize_recording } =
@@ -542,7 +568,8 @@ module Make_commands (Backend : Backend_intf.S) = struct
     and trace_scope = Trace_scope.param
     and timer_resolution = Timer_resolution.param
     and backend_opts = Backend.Record_opts.param
-    and collection_mode = Collection_mode.param in
+    and collection_mode = Collection_mode.param
+    and control_fd = Control_fd.param in
     fun ~executable ~f ->
       let record_dir, cleanup =
         match record_dir with
@@ -566,6 +593,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
             ; trace_scope
             ; timer_resolution
             ; collection_mode
+            ; control_fd
             })
   ;;
 

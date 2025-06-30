@@ -215,6 +215,16 @@ module Recording = struct
       | Ctlfd { ctlfd; shutdown; _ } ->
         Perf_ctlfd.dispatch_and_block_for_ack ctlfd shutdown |> ignore_perf_exit
     ;;
+
+    let enable t =
+      match t with
+      | Signals _ -> Or_error.error_string "Can't enable recording: perf not using ctlfd"
+      | Ctlfd { ctlfd; _ } ->
+        (match Perf_ctlfd.(dispatch_and_block_for_ack ctlfd Command.enable) with
+         | Error `Perf_exited ->
+           Or_error.error_string "Can't enable recording: perf exited"
+         | Ok () -> Ok ())
+    ;;
   end
 
   type t =
@@ -352,6 +362,7 @@ module Recording = struct
     ~(timer_resolution : Timer_resolution.t)
     ~record_dir
     ~(collection_mode : Collection_mode.t)
+    ~start_disabled
     pids
     =
     let%bind () = init_record_dir record_dir in
@@ -494,6 +505,16 @@ module Recording = struct
         (* We don't take perf AUX snapshots in stacktrace sampling mode *)
         Control.create ~capabilities ~snapshot_when:Never
     in
+    let%bind.Deferred.Or_error delay_opt =
+      if start_disabled
+      then (
+        match control with
+        | Ctlfd _ -> Deferred.Or_error.return [ "--delay=-1" ]
+        | Signals _ ->
+          Deferred.Or_error.error_string
+            "Tried to start perf with events disabled, but we didn't configure controlfds")
+      else Deferred.Or_error.return []
+    in
     let overwrite_opts =
       match collection_mode, full_execution with
       | Stacktrace_sampling _, false -> [ "--overwrite" ]
@@ -513,6 +534,7 @@ module Recording = struct
         ; thread_opts
         ; pid_opt
         ; control_opt
+        ; delay_opt
         ; kcore_opts
         ; snapshot_size_opt
         ; Callgraph_mode.to_perf_record_args selected_callgraph_mode
@@ -539,6 +561,8 @@ module Recording = struct
     ( { pid = perf_pid; snapshot_when; control }
     , { Data.callgraph_mode = selected_callgraph_mode } )
   ;;
+
+  let enable t = Control.enable t.control
 
   let maybe_take_snapshot t ~source =
     match t.snapshot_when, source with

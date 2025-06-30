@@ -3,6 +3,7 @@ open! Core
 module Command = struct
   type t = string
 
+  let enable = "enable\n"
   let snapshot = "snapshot\n"
   let stop = "stop\n"
 end

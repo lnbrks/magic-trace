@@ -11,6 +11,7 @@ val control_opt : t -> string list * (unit -> unit)
 module Command : sig
   type t
 
+  val enable : t
   val snapshot : t
   val stop : t
 end
